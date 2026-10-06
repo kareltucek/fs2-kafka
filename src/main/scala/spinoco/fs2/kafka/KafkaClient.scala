@@ -590,7 +590,7 @@ object KafkaClient {
                       val messages = messagesFromResult(protocol, result)
 
                       val updateLastKnown = messages.lastOption.map(m => m.offset) match {
-                        case None => Stream.empty.covary[F] // No messages emitted, just go on
+                        case None => Stream.exec(startFromRef.update { case (start, _) => (start, 0) }) // No messages, but leader is healthy
                         case Some(lastOffset) => Stream.exec(startFromRef.set ((offset(lastOffset + 1), 0)))
                       }
 
