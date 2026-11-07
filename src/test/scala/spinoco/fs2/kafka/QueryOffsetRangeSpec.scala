@@ -46,6 +46,10 @@ class QueryOffsetRangeSpec extends Fs2KafkaClientSpec {
     OffsetResponse(Vector((testTopic, Vector(PartitionOffsetResponse(part0, None, new Date(0), Vector(offset(head), offset(10)))))))
   }
 
+  val notLeader: OffsetResponse = {
+    OffsetResponse(Vector((testTopic, Vector(PartitionOffsetResponse(part0, Some(ErrorType.NOT_LEADER_FOR_PARTITION), new Date(0), Vector.empty)))))
+  }
+
   def offsetConnection(dns: Ref[IO, Set[String]])(address: BrokerAddress): Pipe[IO, OffsetsRequest, OffsetResponse] =
     _.evalMap { _ => resolve(dns, address) as offsetsFrom(address) }
 
@@ -103,7 +107,43 @@ class QueryOffsetRangeSpec extends Fs2KafkaClientSpec {
       result.left.toOption.collect { case BrokerReportedFailure(_, _, err) => err } shouldBe Some(ErrorType.UNKNOWN)
     }
 
-    "fails when no leader is known" in {
+    "follows leader change when broker reports it is not the leader" in {
+      val result = {
+        run(mkDns("broker-a", "broker-b") flatMap { dns =>
+          Ref.of[IO, Int](0) flatMap { lookups =>
+            def getLeader(topicId: String @@ TopicName, partition: Int @@ PartitionId): IO[Option[BrokerAddress]] = {
+              lookups.getAndUpdate(_ + 1) map { n => if (n == 0) Some(seedA) else Some(seedB) }
+            }
+            def connection(address: BrokerAddress): Pipe[IO, OffsetsRequest, OffsetResponse] = {
+              if (address == seedA) _.map(_ => notLeader) else offsetConnection(dns)(address)
+            }
+            queryOffsetRange(getLeader, connection)
+          }
+        })
+      }
+      result shouldBe ((2L, 10L))
+    }
+
+    "fails with broker failure when leader keeps reporting it is not the leader" in {
+      val result = run(queryOffsetRange((_, _) => IO.pure(Some(seedA)), _ => _.map(_ => notLeader)).attempt)
+      result.left.toOption.collect { case BrokerReportedFailure(_, _, err) => err } shouldBe Some(ErrorType.NOT_LEADER_FOR_PARTITION)
+    }
+
+    "waits until leader is elected" in {
+      val result = {
+        run(mkDns("broker-a") flatMap { dns =>
+          Ref.of[IO, Int](0) flatMap { lookups =>
+            def getLeader(topicId: String @@ TopicName, partition: Int @@ PartitionId): IO[Option[BrokerAddress]] = {
+              lookups.getAndUpdate(_ + 1) map { n => if (n < 3) None else Some(seedA) }
+            }
+            queryOffsetRange(getLeader, offsetConnection(dns))
+          }
+        })
+      }
+      result shouldBe ((1L, 10L))
+    }
+
+    "fails when no leader is ever known" in {
       run(queryOffsetRange((_, _) => IO.pure(None), _ => _ => Stream.empty).attempt) shouldBe Left(LeaderNotAvailable(testTopic, part0))
     }
 

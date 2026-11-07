@@ -459,6 +459,9 @@ object KafkaClient {
 
     val consumerBrokerId = tag[Broker](-1)
 
+    /** Errors reported by a broker that is no longer (or not yet) leader of the partition **/
+    val leaderMovedErrors: Set[ErrorType.Value] = Set(ErrorType.NOT_LEADER_FOR_PARTITION, ErrorType.LEADER_NOT_AVAILABLE)
+
 
     /**
       * Augments connection to broker to FetchRequest/FetchResponse pattern.
@@ -708,7 +711,8 @@ object KafkaClient {
       * @param partition            Id of the partition
       * @param getLeader            Queries leader for the partition supplied
       * @param brokerOffsetConnection     A function to create connection to broker to send // receive OffsetRequests
-      * @param leaderFailureTimeout When connection to the leader fails, wait this long, then query the leader again and retry
+      * @param leaderFailureTimeout When no leader is known, connection to the leader fails or it is no longer leader,
+      *                             wait this long, then query the leader again and retry
       * @param leaderFailureMaxAttempts  Maximum attempts to query the offsets, then this fails with the last failure
       * @tparam F
       */
@@ -726,7 +730,11 @@ object KafkaClient {
       val requestOffsetDataMax = OffsetsRequest(consumerBrokerId, Vector((topicId, Vector((partition, new Date(-2), Some(Int.MaxValue))))))
 
       val findLeader: F[BrokerAddress] = {
-        getLeader(topicId, partition).flatMap(_.liftTo[F](LeaderNotAvailable(topicId, partition)))
+        getLeader(topicId, partition)
+        .flatMap(_.liftTo[F](LeaderNotAvailable(topicId, partition)))
+        .onError { case failure =>
+          Logger[F].warn(s"No leader known for $topicId[$partition], retrying in $leaderFailureTimeout", failure)
+        }
       }
 
       def queryLeader(leader: BrokerAddress): F[(BrokerAddress, Vector[OffsetResponse])] = {
@@ -738,16 +746,26 @@ object KafkaClient {
           .take(2)
           .compile.toVector
         )
-        .map { responses => (leader, responses) }
+        .flatMap { responses =>
+          // leadership moved between the leader lookup and the query; next attempt looks the leader up again
+          partitionResults(responses).flatMap(_.error).find(leaderMovedErrors.contains) match {
+            case Some(err) => Sync[F].raiseError[(BrokerAddress, Vector[OffsetResponse])](BrokerReportedFailure(leader, requestOffsetDataMin, err))
+            case None => Applicative[F].pure((leader, responses))
+          }
+        }
         .onError { case failure =>
           Logger[F].warn(s"Failed to query offsets for $topicId[$partition] at leader $leader, retrying in $leaderFailureTimeout", failure)
         }
       }
 
+      // results for our topic and partition
+      def partitionResults(responses: Vector[OffsetResponse]): Vector[PartitionOffsetResponse] = {
+        responses.flatMap(_.data.filter(_._1 == topicId).flatMap(_._2.find(_.partitionId == partition)))
+      }
+
       def extractOffsetRange(leaderResponses: (BrokerAddress, Vector[OffsetResponse])): F[(Long @@ Offset, Long @@ Offset)] = {
         val (leader, responses) = leaderResponses
-        // results for our topic and partition
-        val results = responses.flatMap(_.data.filter(_._1 == topicId).flatMap(_._2.find(_.partitionId == partition)))
+        val results = partitionResults(responses)
         // first error reported by the broker in any of the responses, if any
         results.collectFirst(Function.unlift(_.error)) match {
           case Some(err) => Sync[F].raiseError(BrokerReportedFailure(leader, requestOffsetDataMin, err))
@@ -761,7 +779,7 @@ object KafkaClient {
 
       findLeader
       .flatMap(queryLeader)
-      .retry(leaderFailureTimeout, leaderFailureMaxAttempts)(!_.isInstanceOf[LeaderNotAvailable])
+      .retry(leaderFailureTimeout, leaderFailureMaxAttempts)(_ => true)
       .flatMap(extractOffsetRange)
     }
 
